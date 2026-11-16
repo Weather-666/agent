@@ -1,0 +1,39 @@
+#!/usr/bin/env python3
+"""Migrate one stopped Runtime Home from the former root execution identity."""
+
+import os
+import re
+import stat
+import sys
+from pathlib import Path
+
+if os.geteuid() != 0 or len(sys.argv) != 3:
+    raise SystemExit("Usage as root: repair-runtime-ownership /absolute/runtime-root /absolute/expert-codex-<id>")
+
+root = Path(sys.argv[1])
+home = Path(sys.argv[2])
+if (
+    not root.is_absolute()
+    or root.resolve(strict=True) != root
+    or not home.is_absolute()
+    or home.parent != root
+    or home.resolve(strict=True) != home
+    or not re.fullmatch(r"expert-codex-[0-9a-f]{16}", home.name)
+):
+    raise SystemExit("Expected a real managed Codex Runtime Home")
+owner = home.stat().st_uid
+if owner == 0:
+    raise SystemExit("The Runtime Home must already belong to the Backend service user")
+
+changed = 0
+for directory, directories, files in os.walk(home, followlinks=False):
+    for name in directories + files:
+        path = Path(directory) / name
+        previous = path.lstat()
+        if previous.st_uid != 0:
+            continue
+        os.chown(path, owner, -1, follow_symlinks=False)
+        if not stat.S_ISLNK(previous.st_mode):
+            os.chmod(path, stat.S_IMODE(previous.st_mode))
+        changed += 1
+print(f"Updated owner metadata for {changed} Runtime paths")

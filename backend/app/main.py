@@ -1,0 +1,287 @@
+import asyncio
+import logging
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager, suppress
+
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.routing import APIRoute
+
+from app.api.library_mcp import router as library_mcp_router
+from app.api.knowledge_mcp import router as knowledge_mcp_router
+from app.api.v1.router import api_router
+from app.core.config import Settings, get_settings
+from app.core.errors import install_error_handlers
+from app.core.request_id import RequestIdMiddleware
+from app.db import migrate_database
+from app.services.chat_execution import ChatExecution
+from app.services.expert_runtime_reconciliation import reconcile_published_experts
+from app.services.knowledge_index_worker import (
+    reconcile_knowledge_indexes,
+    run_knowledge_index_worker,
+)
+
+
+logger = logging.getLogger(__name__)
+
+
+OPENAPI_TAGS = [
+    {"name": "health", "description": "Service liveness checks."},
+    {"name": "auth", "description": "Login, token refresh and logout."},
+    {"name": "audit-events", "description": "Read successful platform operation audit events."},
+    {"name": "users", "description": "Regular users, platform staff and account lifecycle."},
+    {"name": "tenants", "description": "Tenants, workspaces and tenant members."},
+    {"name": "expert-categories", "description": "Create, query, update and delete expert categories."},
+    {"name": "experts", "description": "Create, query, update, delete and switch expert status."},
+    {"name": "expert-market", "description": "Expert marketplace categories and published experts (requires sign-in)."},
+    {"name": "plans", "description": "Manage expert subscription plans."},
+    {"name": "plan-market", "description": "Signed-in user plan catalog and current subscription."},
+    {"name": "credits", "description": "Tenant product-credit summaries, ledger and adjustments."},
+    {"name": "rbac", "description": "Platform roles, tenant roles and member authorization."},
+    {"name": "models", "description": "Models available to tenants."},
+    {
+        "name": "mcp-connectors",
+        "description": "Enabled Agent Gateway MCP Connectors with sensitive fields removed.",
+    },
+    {"name": "ops", "description": "System operations and cleanup."},
+    {"name": "chat", "description": "Tenant chat sessions, turns and permission events."},
+    {"name": "library", "description": "Personal user library files."},
+    {"name": "knowledge-bases", "description": "Platform knowledge base management."},
+    {"name": "docs", "description": "Knowledge base document upload, view, update and delete."},
+    {"name": "knowledge-index", "description": "Knowledge index review and release."},
+    {"name": "skills", "description": "Platform skill upload, view, update and delete."},
+    {"name": "storage", "description": "Signed local object upload and download URLs."},
+]
+
+OPENAPI_OPERATION_SUMMARIES = {
+    ("GET", "/health"): "Health check",
+    ("POST", "/api/v1/auth/login"): "User login",
+    ("GET", "/api/v1/auth/me"): "Get current authenticated user",
+    ("PATCH", "/api/v1/auth/me"): "Update current user profile",
+    ("PUT", "/api/v1/auth/me/avatar"): "Upload or replace current user avatar",
+    ("DELETE", "/api/v1/auth/me/avatar"): "Delete current user avatar",
+    ("POST", "/api/v1/auth/refresh"): "Refresh access token",
+    ("POST", "/api/v1/auth/logout"): "Logout",
+    ("POST", "/api/v1/auth/password-reset/request"): "Request a password reset code",
+    ("POST", "/api/v1/auth/password-reset/confirm"): "Confirm a password reset",
+    ("GET", "/api/v1/audit-events"): "List platform audit events",
+    ("POST", "/api/v1/users/register"): "Register a regular user",
+    ("GET", "/api/v1/users"): "List regular users",
+    ("POST", "/api/v1/users/platform/activate"): "Activate a platform user",
+    ("GET", "/api/v1/users/platform"): "List platform users",
+    ("POST", "/api/v1/users/platform"): "Create a platform user",
+    ("GET", "/api/v1/users/{user_id}/tenants"): "List the user's tenants",
+    ("GET", "/api/v1/users/{user_id}"): "Get user details",
+    ("PATCH", "/api/v1/users/{user_id}"): "Update user profile",
+    ("PATCH", "/api/v1/users/{user_id}/status"): "Update user status",
+    ("GET", "/api/v1/tenants"): "List tenants",
+    ("POST", "/api/v1/tenants"): "Create a tenant",
+    ("GET", "/api/v1/tenants/{tenant_id}"): "Get tenant details",
+    ("PATCH", "/api/v1/tenants/{tenant_id}"): "Update tenant",
+    ("PATCH", "/api/v1/tenants/{tenant_id}/status"): "Update tenant status",
+    ("PATCH", "/api/v1/tenants/{tenant_id}/subscription"): "Update tenant subscription",
+    ("GET", "/api/v1/credits/current"): "Get current tenant credits",
+    ("GET", "/api/v1/tenants/{tenant_id}/credits/current"): "Get tenant credits",
+    ("GET", "/api/v1/tenants/{tenant_id}/credits/ledger"): "List tenant credit ledger",
+    ("POST", "/api/v1/tenants/{tenant_id}/credits/adjustments"): "Adjust tenant credits",
+    ("GET", "/api/v1/tenants/{tenant_id}/members"): "List tenant members",
+    ("POST", "/api/v1/tenants/{tenant_id}/members"): "Add a tenant member",
+    ("PATCH", "/api/v1/tenants/{tenant_id}/members/{user_id}"): "Update tenant member role",
+    ("DELETE", "/api/v1/tenants/{tenant_id}/members/{user_id}"): "Remove a tenant member",
+    ("GET", "/api/v1/expert-categories"): "List expert categories",
+    ("POST", "/api/v1/expert-categories"): "Create an expert category",
+    ("GET", "/api/v1/expert-categories/{category_id}"): "Get expert category details",
+    ("PATCH", "/api/v1/expert-categories/{category_id}"): "Update an expert category",
+    ("DELETE", "/api/v1/expert-categories/{category_id}"): "Delete an expert category",
+    ("GET", "/api/v1/experts"): "List experts",
+    ("GET", "/api/v1/experts/search/name"): "Search experts by name",
+    ("GET", "/api/v1/experts/search/category"): "Search experts by category",
+    ("GET", "/api/v1/experts/search/status"): "Search experts by status",
+    ("POST", "/api/v1/experts"): "Create an expert",
+    ("GET", "/api/v1/experts/stats/summary"): "Get expert statistics",
+    ("GET", "/api/v1/experts/{expert_id}"): "Get expert details",
+    ("PATCH", "/api/v1/experts/{expert_id}"): "Update an expert",
+    ("DELETE", "/api/v1/experts/{expert_id}"): "Delete an expert",
+    ("PATCH", "/api/v1/experts/{expert_id}/status"): "Update expert status",
+    ("GET", "/api/v1/expert-market/categories"): "List public expert categories",
+    ("GET", "/api/v1/expert-market/experts"): "List public experts",
+    ("GET", "/api/v1/expert-market/experts/{expert_id}"): "Get public expert details",
+    ("GET", "/api/v1/plans"): "List plans",
+    ("POST", "/api/v1/plans"): "Create a plan",
+    ("GET", "/api/v1/plans/{plan_id}"): "Get plan details",
+    ("PATCH", "/api/v1/plans/{plan_id}"): "Update a plan",
+    ("DELETE", "/api/v1/plans/{plan_id}"): "Delete a plan",
+    ("PUT", "/api/v1/plans/{plan_id}/prices"): "Replace plan prices",
+    ("PUT", "/api/v1/plans/{plan_id}/entitlements"): "Replace plan entitlements",
+    ("PUT", "/api/v1/plans/{plan_id}/experts"): "Replace plan experts",
+    ("GET", "/api/v1/plan-market/plans"): "List market plans",
+    ("GET", "/api/v1/plan-market/current-subscription"): "Get current subscription",
+    ("PATCH", "/api/v1/plan-market/current-subscription"): "Upgrade current subscription",
+    ("GET", "/api/v1/rbac/tenant/users"): "List current tenant users",
+    ("POST", "/api/v1/rbac/tenant/users/{user_id}/roles"): "Grant or update tenant role",
+    ("DELETE", "/api/v1/rbac/tenant/users/{user_id}"): "Remove current tenant member",
+    ("GET", "/api/v1/rbac/platform/roles"): "List platform roles",
+    ("POST", "/api/v1/rbac/platform/users/{user_id}/roles"): "Grant platform role",
+    ("DELETE", "/api/v1/rbac/platform/users/{user_id}/roles/{role}"): "Revoke platform role",
+    ("GET", "/api/v1/models/llm"): "List LLM models",
+    ("GET", "/api/v1/models/embedding"): "Get embedding model info",
+    ("GET", "/api/v1/mcp-connectors"): "List selectable MCP Connectors",
+    ("GET", "/api/v1/ops/metrics"): "Get system metrics",
+    ("POST", "/api/v1/ops/storage/gc"): "Run object storage GC",
+    ("GET", "/api/v1/chat/search"): "Search chat history",
+    ("POST", "/api/v1/chat/sessions"): "Create a chat session",
+    ("GET", "/api/v1/chat/sessions"): "List chat sessions",
+    ("GET", "/api/v1/chat/sessions/{session_id}"): "Get chat session details",
+    ("DELETE", "/api/v1/chat/sessions/{session_id}"): "Delete a chat session",
+    ("GET", "/api/v1/chat/sessions/{session_id}/messages"): "List chat messages",
+    ("PATCH", "/api/v1/chat/sessions/{session_id}/title"): "Rename a chat session",
+    ("PATCH", "/api/v1/chat/sessions/{session_id}/pin"): "Pin or unpin a chat session",
+    ("PATCH", "/api/v1/chat/sessions/{session_id}/archive"): "Archive or unarchive a chat session",
+    ("POST", "/api/v1/chat/sessions/{session_id}/turns"): "Create and stream a chat turn",
+    ("POST", "/api/v1/chat/turns/{turn_id}/cancel"): "Cancel a chat turn",
+    ("GET", "/api/v1/chat/turns/{turn_id}/events"): "Stream chat turn events",
+    ("POST", "/api/v1/chat/permissions/{permission_id}"): "Resolve a chat permission request",
+    ("GET", "/api/v1/library/files"): "List personal library files",
+    ("POST", "/api/v1/library/files/upload-url"): "Create a personal library file upload URL",
+    ("POST", "/api/v1/library/files/complete-upload"): "Complete a personal library file upload",
+    ("GET", "/api/v1/library/files/{file_id}/preview"): "Preview a personal library file",
+    ("GET", "/api/v1/library/files/{file_id}/download"): "Download a personal library file",
+    ("DELETE", "/api/v1/library/files/{file_id}"): "Delete a personal library file",
+    ("POST", "/api/v1/knowledge-bases"): "Create a knowledge base",
+    ("GET", "/api/v1/knowledge-bases"): "List knowledge bases",
+    ("GET", "/api/v1/knowledge-bases/{knowledge_base_id}"): "Get knowledge base details",
+    ("PATCH", "/api/v1/knowledge-bases/{knowledge_base_id}"): "Update a knowledge base",
+    ("DELETE", "/api/v1/knowledge-bases/{knowledge_base_id}"): "Delete a knowledge base",
+    ("POST", "/api/v1/knowledge-bases/{knowledge_base_id}/docs/upload-url"): "Create a document upload URL",
+    ("POST", "/api/v1/knowledge-bases/{knowledge_base_id}/docs/upload-urls"): "Create document upload URLs",
+    ("POST", "/api/v1/knowledge-bases/{knowledge_base_id}/docs/complete-upload"): "Complete a document upload",
+    ("POST", "/api/v1/knowledge-bases/{knowledge_base_id}/docs/complete-uploads"): "Complete document uploads",
+    ("POST", "/api/v1/knowledge-bases/{knowledge_base_id}/docs/{document_id}/upload-url"): "Create a document source replacement upload URL",
+    ("POST", "/api/v1/knowledge-bases/{knowledge_base_id}/docs/{document_id}/complete-upload"): "Complete a document source replacement",
+    ("GET", "/api/v1/knowledge-bases/{knowledge_base_id}/docs"): "List knowledge base documents",
+    ("GET", "/api/v1/knowledge-bases/{knowledge_base_id}/docs/{document_id}"): "Get document details",
+    ("PATCH", "/api/v1/knowledge-bases/{knowledge_base_id}/docs/{document_id}"): "Update document metadata",
+    ("DELETE", "/api/v1/knowledge-bases/{knowledge_base_id}/docs/{document_id}"): "Delete a document",
+    ("GET", "/api/v1/knowledge-bases/{knowledge_base_id}/docs/{document_id}/download-url"): "Get a document download URL",
+    ("GET", "/api/v1/knowledge-bases/{knowledge_base_id}/index-review"): "Get pending knowledge index review",
+    ("POST", "/api/v1/knowledge-bases/{knowledge_base_id}/index-review/approve"): "Release a paused knowledge index batch",
+    ("POST", "/api/v1/skills"): "Upload a skill",
+    ("GET", "/api/v1/skills"): "List skills",
+    ("GET", "/api/v1/skills/{slug}"): "Get skill details",
+    ("PUT", "/api/v1/skills/{slug}"): "Update a skill",
+    ("DELETE", "/api/v1/skills/{slug}"): "Delete a skill",
+    ("GET", "/api/v1/skills/{slug}/file"): "Get a skill file",
+    ("PUT", "/api/v1/storage/objects/{token}"): "Upload a local object",
+    ("GET", "/api/v1/storage/objects/{token}"): "Download a local object",
+}
+
+
+def create_app(settings: Settings | None = None) -> FastAPI:
+    settings = settings or get_settings()
+
+    chat_execution = ChatExecution(settings)
+
+    @asynccontextmanager
+    async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        if settings.database_auto_migrate:
+            migrate_database(settings)
+        chat_execution.recover()
+        await reconcile_knowledge_indexes(settings)
+        runtime_summary = await reconcile_published_experts(settings)
+        for item in runtime_summary.items:
+            if item.outcome == "failed":
+                logger.error(
+                    "Published Expert startup repair failed: "
+                    "expert_id=%s status=%s code=%s fail_closed=%s fail_closed_code=%s",
+                    item.expert_id,
+                    item.expert_status,
+                    item.error_code,
+                    item.fail_closed,
+                    item.fail_closed_error_code,
+                )
+            elif item.outcome == "repaired":
+                logger.warning(
+                    "Published Expert startup drift repaired: expert_id=%s",
+                    item.expert_id,
+                )
+        summary_log = (
+            logger.error
+            if runtime_summary.failed
+            else logger.warning
+            if runtime_summary.repaired
+            else logger.info
+        )
+        summary_log(
+            "Published Expert startup reconciliation complete: healthy=%d repaired=%d failed=%d",
+            runtime_summary.healthy,
+            runtime_summary.repaired,
+            runtime_summary.failed,
+        )
+        if any(
+            item.outcome == "failed"
+            and (item.expert_status == "published" or not item.fail_closed)
+            for item in runtime_summary.items
+        ):
+            raise RuntimeError(
+                "Published Expert startup reconciliation could not fail closed"
+            )
+        # Per-document sync worker: binding outbox, Docling conversion, LightRAG ingestion and
+        # asynchronous deletion. Historical Build rows are not consumed by this loop.
+        index_worker_task = asyncio.create_task(
+            run_knowledge_index_worker(settings), name="kb-index-worker"
+        )
+        try:
+            yield
+        finally:
+            await chat_execution.close()
+            index_worker_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await index_worker_task
+
+    app = FastAPI(
+        title="Experts Backend API",
+        version="0.1.0",
+        description=(
+            "Swagger/OpenAPI documentation for the Experts backend service. "
+            "Platform APIs do not require x-tenant-id; tenant APIs require x-tenant-id "
+            "in the request header."
+        ),
+        openapi_tags=OPENAPI_TAGS,
+        lifespan=lifespan,
+    )
+
+    app.state.chat_execution = chat_execution
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=settings.cors_origins,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+    app.add_middleware(RequestIdMiddleware)
+
+    install_error_handlers(app)
+    app.dependency_overrides[get_settings] = lambda: settings
+
+    @app.get("/health", tags=["health"], summary="Health check")
+    async def health() -> dict[str, str]:
+        return {"status": "ok", "service": "experts-backend"}
+
+    app.include_router(api_router, prefix="/api/v1")
+    app.include_router(knowledge_mcp_router)
+    app.include_router(library_mcp_router)
+    _apply_operation_summaries(app)
+    return app
+
+
+def _apply_operation_summaries(app: FastAPI) -> None:
+    for route in app.routes:
+        if not isinstance(route, APIRoute):
+            continue
+        for method in route.methods or set():
+            summary = OPENAPI_OPERATION_SUMMARIES.get((method, route.path))
+            if summary:
+                route.summary = summary
+
+
+app = create_app()

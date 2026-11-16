@@ -1,0 +1,163 @@
+name: Deploy Backend (dev)
+
+on:
+  push:
+    branches: [dev]
+  workflow_dispatch:  # 支持手动触发
+
+jobs:
+  deploy:
+    name: Deploy to Production Server
+    runs-on: self-hosted  # 使用自托管 Runner（运行在目标服务器上）
+    environment: production-backend
+
+    steps:
+      - name: 📋 Print deployment info
+        run: |
+          echo "========================================"
+          echo "  Backend Deployment"
+          echo "  Branch: ${{ github.ref_name }}"
+          echo "  Commit: ${{ github.sha }}"
+          echo "  Actor:  ${{ github.actor }}"
+          echo "  Time:   $(date '+%Y-%m-%d %H:%M:%S')"
+          echo "========================================"
+
+      - name: 📦 Pull latest code
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: |
+          DEPLOY_DIR="/usr/local/amazon/amazon-experts-backend-dev"
+          BRANCH="dev"
+
+          if [ -d "$DEPLOY_DIR/.git" ]; then
+            echo "Repository exists. Pulling latest..."
+            cd "$DEPLOY_DIR"
+            # 临时设置带 token 的 URL 用于 pull
+            git remote set-url origin "https://${GH_TOKEN}@github.com/opmartai/amazon-experts-backend.git"
+            git fetch origin
+            git checkout -f "$BRANCH"
+            git reset --hard "origin/${BRANCH}"
+            # 🔒 立即清除 token
+            git remote set-url origin "https://github.com/opmartai/amazon-experts-backend.git"
+            echo "🔒 Token removed from git config"
+          else
+            echo "Repository not found. Cloning..."
+            git clone -b "$BRANCH" "https://${GH_TOKEN}@github.com/opmartai/amazon-experts-backend.git" "$DEPLOY_DIR"
+            cd "$DEPLOY_DIR"
+            git remote set-url origin "https://github.com/opmartai/amazon-experts-backend.git"
+            echo "🔒 Token removed from git config"
+          fi
+
+          # 清除 bash history 中的 token
+          history -c
+
+          # 验证
+          cd "$DEPLOY_DIR"
+          echo "Latest commits:"
+          git log --oneline -5
+
+      - name: 💾 Backup configuration files
+        run: |
+          DEPLOY_DIR="/usr/local/amazon/amazon-experts-backend-dev"
+          BACKUP_DIR="/opt/backups"
+          BACKUP_TS=$(date +%Y%m%d_%H%M%S)
+
+          mkdir -p "${BACKUP_DIR}/${BACKUP_TS}"
+
+          # 备份 .env 文件
+          if [ -f "${DEPLOY_DIR}/.env" ]; then
+            cp "${DEPLOY_DIR}/.env" "${BACKUP_DIR}/${BACKUP_TS}/.env"
+            echo "✅ Backed up .env"
+          else
+            echo "⚠️ .env not found"
+          fi
+
+          # 保存备份时间戳供回滚使用
+          echo "${BACKUP_TS}" > "${BACKUP_DIR}/last_backup_ts"
+          echo "Backup timestamp: ${BACKUP_TS}"
+
+      - name: 🔨 Install dependencies
+        run: |
+          DEPLOY_DIR="/usr/local/amazon/amazon-experts-backend-dev"
+          cd "$DEPLOY_DIR"
+
+          # 确保 .venv 存在
+          if [ ! -d ".venv" ]; then
+            echo "Creating Python virtual environment..."
+            python3 -m venv .venv
+          fi
+
+          # 安装依赖
+          echo "Installing dependencies..."
+          source .venv/bin/activate
+          pip install -e '.[dev]'
+          echo "✅ Dependencies installed"
+
+      - name: 🔄 Restart backend service
+        run: |
+          echo "Restarting amazon-expert-backend service..."
+          systemctl restart amazon-experts-backend
+          echo "✅ Service restarted"
+
+      - name: ✅ Health check
+        run: |
+          DEPLOY_DIR="/usr/local/amazon/amazon-experts-backend-dev"
+          HEALTH_URL="http://127.0.0.1:15000/health"
+          MAX_RETRIES=60
+          RETRY_INTERVAL=3
+
+          for i in $(seq 1 $MAX_RETRIES); do
+            echo "Health check attempt $i/$MAX_RETRIES..."
+            if curl --noproxy '*' -fsS "$HEALTH_URL" > /dev/null 2>&1; then
+              echo "✅ Health check PASSED!"
+              echo "Backend is running on port 15000"
+              exit 0
+            fi
+            sleep $RETRY_INTERVAL
+          done
+
+          echo "❌ Health check FAILED after $MAX_RETRIES attempts!"
+          echo "Attempting rollback..."
+
+          # 回滚：还原配置文件并重启
+          BACKUP_DIR="/opt/backups"
+          LAST_TS=$(cat "${BACKUP_DIR}/last_backup_ts" 2>/dev/null || echo "")
+
+          if [ -n "$LAST_TS" ] && [ -d "${BACKUP_DIR}/${LAST_TS}" ]; then
+            echo "Restoring backup from ${LAST_TS}..."
+            if [ -f "${BACKUP_DIR}/${LAST_TS}/.env" ]; then
+              cp "${BACKUP_DIR}/${LAST_TS}/.env" "${DEPLOY_DIR}/.env"
+              echo "✅ .env restored"
+            fi
+            systemctl restart amazon-experts-backend
+            for i in $(seq 1 20); do
+              echo "Rollback health check attempt $i/20..."
+              if curl --noproxy '*' -fsS "$HEALTH_URL" > /dev/null 2>&1; then
+                echo "✅ Rollback succeeded! Service is running."
+                exit 0
+              fi
+              sleep "$RETRY_INTERVAL"
+            done
+            echo "❌ Rollback also failed!"
+            exit 1
+          else
+            echo "❌ No backup available for rollback!"
+            exit 1
+          fi
+
+      - name: 📊 Deployment summary
+        if: always()
+        run: |
+          echo "========================================"
+          echo "  Deployment Summary"
+          echo "========================================"
+          echo "  Project:  amazon-expert-backend"
+          echo "  Type:     Python/FastAPI"
+          echo "  Branch:   dev"
+          echo "  Commit:   $(cd /usr/local/amazon/amazon-experts-backend-dev && git log --oneline -1)"
+          echo "  Port:     15000"
+          echo "  Service:  amazon-expert-backend (systemd)"
+          echo "========================================"
+
+          # 查看服务状态
+          systemctl status amazon-experts-backend --no-pager || true

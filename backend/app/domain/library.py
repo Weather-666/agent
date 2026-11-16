@@ -1,0 +1,191 @@
+from typing import Any, Literal
+
+from pydantic import BaseModel, Field
+
+
+LibraryFileType = Literal["image", "file"]
+LibrarySort = Literal[
+    "updatedAt_desc",
+    "updatedAt_asc",
+    "name_asc",
+    "name_desc",
+    "size_desc",
+    "size_asc",
+]
+LibraryPreviewType = Literal["url", "text", "unsupported"]
+LibrarySpaceType = Literal["personal", "team"]
+LibrarySpaceStatus = Literal["full", "read_only", "none"]
+
+
+class LibraryFile(BaseModel):
+    id: str
+    name: str
+    mimeType: str | None = None
+    type: LibraryFileType
+    sizeBytes: int
+    sizeLabel: str
+    # Lifecycle (docs/LIBRARY_FILE_LIFECYCLE.md §3). expiresAt is set only for temporary files.
+    lifecycle: Literal["temporary", "permanent"] = "permanent"
+    expiresAt: str | None = None
+    updatedAt: str
+    createdAt: str
+    previewSupported: bool
+    spaceType: LibrarySpaceType = "personal"
+    ownerUserId: str | None = None
+    ownerTenantId: str | None = None
+    uploadedByUserId: str | None = None
+    capabilities: dict[str, bool] = Field(default_factory=dict)
+
+
+class LibraryFileListResponse(BaseModel):
+    items: list[LibraryFile]
+    total: int
+    page: int
+    pageSize: int
+
+
+class LibraryUploadUrlRequest(BaseModel):
+    fileName: str
+    mimeType: str | None = None
+    fileSizeBytes: int
+    contentHash: str | None = None
+    spaceType: LibrarySpaceType = "personal"
+
+
+class LibraryUploadUrlResponse(BaseModel):
+    uploadSessionId: str
+    fileId: str
+    method: Literal["PUT"] = "PUT"
+    uploadUrl: str
+    headers: dict[str, str] = Field(default_factory=dict)
+    objectKey: str
+    expiresAt: str
+    spaceType: LibrarySpaceType
+    nameConflict: bool = False
+    suggestedName: str
+
+
+class LibraryCompleteUploadRequest(BaseModel):
+    uploadSessionId: str
+    contentHash: str | None = None
+    # docs/LIBRARY_FILE_LIFECYCLE.md §7. 'temporary' mints an unbound chat attachment (expires on
+    # its retention window, bound to a session on first turn use); 'permanent' is a library file.
+    lifecycle: Literal["temporary", "permanent"] = "permanent"
+
+
+class LibraryDownloadResponse(BaseModel):
+    method: Literal["GET"] = "GET"
+    downloadUrl: str
+    expiresAt: str | None = None
+
+
+class LibraryPreviewResponse(BaseModel):
+    previewType: LibraryPreviewType
+    url: str | None = None
+    content: str | None = None
+    mimeType: str | None = None
+    expiresAt: str | None = None
+
+
+class LibraryDeletedResponse(BaseModel):
+    id: str
+    status: Literal["deleted"] = "deleted"
+
+
+class LibraryRenameRequest(BaseModel):
+    name: str
+
+
+class LibraryUsageCategory(BaseModel):
+    fileCount: int = 0
+    fileBytes: int = 0
+    imageCount: int = 0
+    imageBytes: int = 0
+
+
+class LibraryUsageBreakdown(BaseModel):
+    permanent: LibraryUsageCategory = Field(default_factory=LibraryUsageCategory)
+    temporary: LibraryUsageCategory = Field(default_factory=LibraryUsageCategory)
+
+
+class LibrarySpace(BaseModel):
+    spaceType: LibrarySpaceType
+    status: LibrarySpaceStatus
+    quotaBytes: int
+    usedBytes: int
+    reservedBytes: int
+    remainingBytes: int
+    breakdown: LibraryUsageBreakdown = Field(default_factory=LibraryUsageBreakdown)
+    capabilities: dict[str, bool] = Field(default_factory=dict)
+
+
+class LibrarySpacesResponse(BaseModel):
+    items: list[LibrarySpace]
+
+
+class LibraryUploadUrlsRequest(BaseModel):
+    items: list[LibraryUploadUrlRequest] = Field(min_length=1, max_length=50)
+
+
+class LibraryUploadUrlResult(BaseModel):
+    status: Literal["created", "failed"]
+    item: LibraryUploadUrlResponse | None = None
+    error: dict[str, Any] | None = None
+
+
+class LibraryUploadUrlsResponse(BaseModel):
+    items: list[LibraryUploadUrlResult]
+
+
+class LibraryCompleteUploadsRequest(BaseModel):
+    items: list[LibraryCompleteUploadRequest] = Field(min_length=1, max_length=50)
+
+
+class LibraryCompleteUploadResult(BaseModel):
+    status: Literal["completed", "failed"]
+    item: LibraryFile | None = None
+    error: dict[str, Any] | None = None
+
+
+class LibraryCompleteUploadsResponse(BaseModel):
+    items: list[LibraryCompleteUploadResult]
+
+
+class LibraryFileRecord(BaseModel):
+    id: str
+    spaceType: LibrarySpaceType = "personal"
+    ownerUserId: str | None = None
+    ownerTenantId: str | None = None
+    uploadedByUserId: str | None = None
+    displayName: str
+    normalizedName: str
+    mimeType: str | None = None
+    fileType: LibraryFileType
+    extension: str | None = None
+    sizeBytes: int
+    storageObjectKey: str
+    lifecycle: Literal["temporary", "permanent"] = "permanent"
+    expiresAt: str | None = None
+    chatSessionId: str | None = None
+    createdAt: str
+    updatedAt: str
+
+
+class LibraryUploadSessionRecord(BaseModel):
+    id: str
+    fileId: str
+    tenantId: str
+    spaceType: LibrarySpaceType = "personal"
+    ownerUserId: str | None = None
+    ownerTenantId: str | None = None
+    uploadedByUserId: str | None = None
+    requestedName: str
+    mimeType: str | None = None
+    fileType: LibraryFileType
+    extension: str | None = None
+    fileSizeBytes: int
+    storageBucket: str
+    storageObjectKey: str
+    reservedBytes: int
+    status: str
+    expiresAt: str

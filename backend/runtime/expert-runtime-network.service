@@ -1,0 +1,13 @@
+[Unit]
+Description=Block Expert Runtime access to local Gateway management listeners
+After=network-pre.target
+Before=agent-gateway.service amazon-experts-backend.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/amazon/amazon-experts-backend-dev/runtime/sandbox-network apply
+ExecStop=/usr/local/amazon/amazon-experts-backend-dev/runtime/sandbox-network remove
+
+[Install]
+WantedBy=multi-user.target

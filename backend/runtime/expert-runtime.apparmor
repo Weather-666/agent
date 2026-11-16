@@ -1,0 +1,10 @@
+# Ubuntu's userns restriction otherwise transitions nested Bubblewrap into
+# unprivileged_userns, where disconnected /proc UID-map writes can be denied.
+# Allow user namespaces only for the managed launcher and its descendants.
+# Filesystem, capability and management-network boundaries remain in the launcher.
+abi <abi/4.0>,
+include <tunables/global>
+
+profile expert-runtime /usr/local/amazon/amazon-experts-backend-dev/runtime/codex-acp flags=(unconfined) {
+  userns,
+}

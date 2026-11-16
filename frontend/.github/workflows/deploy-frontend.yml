@@ -1,0 +1,167 @@
+name: Deploy Frontend (dev)
+
+on:
+  push:
+    branches: [dev]
+  workflow_dispatch:  # 支持手动触发
+
+jobs:
+  deploy:
+    name: Deploy to Production Server
+    runs-on: self-hosted  # 使用自托管 Runner（运行在目标服务器上）
+    environment: production-frontend
+
+    steps:
+      - name: 📋 Print deployment info
+        run: |
+          echo "========================================"
+          echo "  Frontend Deployment"
+          echo "  Branch: ${{ github.ref_name }}"
+          echo "  Commit: ${{ github.sha }}"
+          echo "  Actor:  ${{ github.actor }}"
+          echo "  Time:   $(date '+%Y-%m-%d %H:%M:%S')"
+          echo "========================================"
+
+      - name: 📦 Pull latest code
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: |
+          DEPLOY_DIR="/usr/local/amazon/amazon-experts-fronted-main"
+          BRANCH="dev"
+
+          if [ -d "$DEPLOY_DIR/.git" ]; then
+            echo "Repository exists. Pulling latest..."
+            cd "$DEPLOY_DIR"
+            git remote set-url origin "https://${GH_TOKEN}@github.com/opmartai/amazon-experts-fronted.git"
+            git fetch origin
+            git checkout -f "$BRANCH"
+            git reset --hard "origin/${BRANCH}"
+            # 🔒 立即清除 token
+            git remote set-url origin "https://github.com/opmartai/amazon-experts-fronted.git"
+            echo "🔒 Token removed from git config"
+          else
+            echo "Repository not found. Cloning..."
+            git clone -b "$BRANCH" "https://${GH_TOKEN}@github.com/opmartai/amazon-experts-fronted.git" "$DEPLOY_DIR"
+            cd "$DEPLOY_DIR"
+            git remote set-url origin "https://github.com/opmartai/amazon-experts-fronted.git"
+            echo "🔒 Token removed from git config"
+          fi
+
+          # 清除 bash history 中的 token
+          history -c
+
+          # 验证
+          cd "$DEPLOY_DIR"
+          echo "Latest commits:"
+          git log --oneline -5
+
+      - name: 💾 Backup configuration files
+        run: |
+          DEPLOY_DIR="/usr/local/amazon/amazon-experts-fronted-main"
+          BACKUP_DIR="/opt/backups"
+          BACKUP_TS=$(date +%Y%m%d_%H%M%S)
+
+          mkdir -p "${BACKUP_DIR}/${BACKUP_TS}"
+
+          # 备份 .env.local
+          if [ -f "${DEPLOY_DIR}/.env.local" ]; then
+            cp "${DEPLOY_DIR}/.env.local" "${BACKUP_DIR}/${BACKUP_TS}/.env.local"
+            echo "✅ Backed up .env.local"
+          else
+            echo "⚠️ .env.local not found"
+          fi
+
+          # 备份 next.config.ts
+          if [ -f "${DEPLOY_DIR}/next.config.ts" ]; then
+            cp "${DEPLOY_DIR}/next.config.ts" "${BACKUP_DIR}/${BACKUP_TS}/next.config.ts"
+            echo "✅ Backed up next.config.ts"
+          else
+            echo "⚠️ next.config.ts not found"
+          fi
+
+          # 保存备份时间戳供回滚使用
+          echo "${BACKUP_TS}" > "${BACKUP_DIR}/last_backup_ts_frontend"
+          echo "Backup timestamp: ${BACKUP_TS}"
+
+      - name: 🔨 Install dependencies & Build
+        run: |
+          DEPLOY_DIR="/usr/local/amazon/amazon-experts-fronted-main"
+          cd "$DEPLOY_DIR"
+
+          echo "Installing dependencies..."
+          npm install
+
+          echo "Building project..."
+          npm run build
+
+          echo "✅ Build completed"
+
+      - name: 🔄 Restart frontend service
+        run: |
+          echo "Restarting amazon-experts-frontend service..."
+          systemctl restart amazon-experts-frontend
+          echo "✅ Service restarted"
+
+      - name: ✅ Health check
+        run: |
+          DEPLOY_DIR="/usr/local/amazon/amazon-experts-fronted-main"
+          MAX_RETRIES=15
+          RETRY_INTERVAL=3
+
+          for i in $(seq 1 $MAX_RETRIES); do
+            echo "Health check attempt $i/$MAX_RETRIES..."
+            if curl -sf http://localhost:3000/ > /dev/null 2>&1; then
+              echo "✅ Health check PASSED!"
+              echo "Frontend is running on port 3000"
+              exit 0
+            fi
+            sleep $RETRY_INTERVAL
+          done
+
+          echo "❌ Health check FAILED after $MAX_RETRIES attempts!"
+          echo "Attempting rollback..."
+
+          # 回滚
+          BACKUP_DIR="/opt/backups"
+          LAST_TS=$(cat "${BACKUP_DIR}/last_backup_ts_frontend" 2>/dev/null || echo "")
+
+          if [ -n "$LAST_TS" ] && [ -d "${BACKUP_DIR}/${LAST_TS}" ]; then
+            echo "Restoring backup from ${LAST_TS}..."
+            if [ -f "${BACKUP_DIR}/${LAST_TS}/.env.local" ]; then
+              cp "${BACKUP_DIR}/${LAST_TS}/.env.local" "${DEPLOY_DIR}/.env.local"
+              echo "✅ .env.local restored"
+            fi
+            if [ -f "${BACKUP_DIR}/${LAST_TS}/next.config.ts" ]; then
+              cp "${BACKUP_DIR}/${LAST_TS}/next.config.ts" "${DEPLOY_DIR}/next.config.ts"
+              echo "✅ next.config.ts restored"
+            fi
+            systemctl restart amazon-experts-frontend
+            sleep 8
+            if curl -sf http://localhost:3000/ > /dev/null 2>&1; then
+              echo "✅ Rollback succeeded! Service is running."
+              exit 0
+            else
+              echo "❌ Rollback also failed!"
+              exit 1
+            fi
+          else
+            echo "❌ No backup available for rollback!"
+            exit 1
+          fi
+
+      - name: 📊 Deployment summary
+        if: always()
+        run: |
+          echo "========================================"
+          echo "  Deployment Summary"
+          echo "========================================"
+          echo "  Project:  amazon-experts-frontend"
+          echo "  Type:     Next.js"
+          echo "  Branch:   dev"
+          echo "  Commit:   $(cd /usr/local/amazon/amazon-experts-fronted-main && git log --oneline -1)"
+          echo "  Port:     3000"
+          echo "  Service:  amazon-experts-frontend (systemd)"
+          echo "========================================"
+
+          # 查看服务状态
+          systemctl status amazon-experts-frontend --no-pager || true

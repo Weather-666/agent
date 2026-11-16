@@ -1,0 +1,214 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+fail() {
+  printf 'codex-acp sandbox: %s\n' "$1" >&2
+  exit 70
+}
+
+runtime_root="${EXPERT_ACP_SANDBOX_RUNTIME_ROOT:?runtime root is required}"
+workspace_root="${EXPERT_ACP_SANDBOX_WORKSPACE_ROOT:?workspace root is required}"
+adapter_link="${EXPERT_ACP_REAL_ADAPTER_COMMAND:-/usr/local/bin/codex-acp}"
+
+[[ "$adapter_link" = /* && "$(basename -- "$adapter_link")" = codex-acp ]] \
+  || fail "real adapter must be an absolute codex-acp path"
+[[ -x "$adapter_link" ]] || fail "real adapter is missing"
+command -v bwrap >/dev/null 2>&1 || fail "bubblewrap is required"
+
+runtime_home="$(realpath -e -- "${HOME:?HOME is required}")" \
+  || fail "HOME does not resolve"
+tenant_cwd="$(pwd -P)" || fail "cwd does not resolve"
+runtime_root="$(realpath -e -- "$runtime_root")" \
+  || fail "runtime root does not resolve"
+workspace_root="$(realpath -e -- "$workspace_root")" \
+  || fail "workspace root does not resolve"
+
+runtime_name="$(basename -- "$runtime_home")"
+if [[ "$(dirname -- "$runtime_home")" != "$runtime_root" \
+  || ! "$runtime_name" =~ ^expert-codex-[0-9a-f]{16}$ ]]; then
+  fail "HOME is outside the managed Codex Runtime root"
+fi
+[[ "${CODEX_HOME:-}" = "$runtime_home" ]] \
+  || fail "CODEX_HOME must equal the managed Runtime Home"
+
+case "$tenant_cwd/" in
+  "$workspace_root/"*) ;;
+  *) fail "cwd is outside the managed tenant workspace root" ;;
+esac
+
+relative_cwd="${tenant_cwd#"$workspace_root"/}"
+if [[ "$relative_cwd" != ".publication/$runtime_name" ]]; then
+  [[ "$relative_cwd" != ".publication" ]] \
+    || fail "the publication workspace root is reserved"
+  IFS=/ read -r tenant_id users_segment user_id extra_segment <<<"$relative_cwd"
+  if [[ -n "$tenant_id" && -z "$users_segment" && -z "$user_id" \
+    && -z "${extra_segment:-}" ]]; then
+    : # Tenant-scoped workspace.
+  elif [[ -n "$tenant_id" && "$users_segment" = users && -n "$user_id" \
+    && -z "${extra_segment:-}" ]]; then
+    : # User-scoped workspace inside one tenant.
+  else
+    fail "cwd must be a tenant workspace, tenant user workspace, or publication workspace"
+  fi
+fi
+
+# Codex starts its own Bubblewrap sandbox for the generated permission profile.
+# Its deny mounts require real, empty destinations inside the active workspace;
+# fail before the adapter starts so a mount-precondition fault is not mistaken
+# for a Skill or command permission failure.
+shopt -s dotglob nullglob
+for protected_name in .git .agents .codex; do
+  protected_target="$tenant_cwd/$protected_name"
+  [[ ! -L "$protected_target" ]] \
+    || fail "workspace sandbox mount target is a symbolic link: $protected_name"
+  [[ -d "$protected_target" ]] \
+    || fail "workspace sandbox mount target is missing: $protected_name"
+  resolved_target="$(realpath -e -- "$protected_target")" \
+    || fail "workspace sandbox mount target does not resolve: $protected_name"
+  [[ "$(dirname -- "$resolved_target")" = "$tenant_cwd" ]] \
+    || fail "workspace sandbox mount target escapes cwd: $protected_name"
+  target_entries=("$protected_target"/*)
+  ((${#target_entries[@]} == 0)) \
+    || fail "workspace sandbox mount target is not empty: $protected_name"
+done
+shopt -u dotglob nullglob
+
+real_adapter="$(readlink -f -- "$adapter_link")" \
+  || fail "real adapter does not resolve"
+wrapper_path="$(readlink -f -- "$0")" || fail "wrapper does not resolve"
+[[ "$real_adapter" != "$wrapper_path" ]] || fail "real adapter resolves to the sandbox wrapper"
+
+# The Gateway runs as root; assign sockets to the dedicated Runtime group before
+# entering a user namespace. Missing deployment rules must fail before ACP starts.
+"$(dirname -- "$wrapper_path")/sandbox-network" check \
+  || fail "Runtime management-network isolation is not installed"
+runtime_gid="$(getent group expert-runtime | cut -d: -f3)"
+runtime_uid="$(stat -c %u -- "$runtime_home")"
+node_binary="$(readlink -f -- "$(command -v node)")" \
+  || fail "Node.js does not resolve"
+node_root="${node_binary%/bin/node}"
+case "$real_adapter/" in
+  "$node_root/"*) ;;
+  *) fail "real adapter is outside the managed Node.js runtime" ;;
+esac
+
+# The standard read-only mounts below already cover a system Node installation
+# under /usr. Rebinding node_root in that case would replace the synthetic
+# /usr/local/amazon parents built for the Runtime and workspace with the host
+# /usr tree. A nested Codex Bubblewrap user namespace could then lose traverse
+# access to those host-owned parents before it mounts read-only Skill assets.
+node_runtime_bind=()
+if [[ "$node_root" != /usr ]]; then
+  node_runtime_bind=(--ro-bind "$node_root" "$node_root")
+fi
+
+# Build only the empty destination parents needed for the two approved binds.
+# Existing system directories are supplied by the read-only mounts below.
+declare -A seen_dirs=(
+  [/usr]=1 [/usr/local]=1 [/usr/local/lib]=1 [/etc]=1 [/proc]=1 [/dev]=1 [/tmp]=1
+)
+dynamic_dirs=()
+append_parent_dirs() {
+  local target="$1" current="" segment
+  local parent
+  local -a segments
+  parent="$(dirname -- "$target")"
+  IFS=/ read -ra segments <<<"${parent#/}"
+  for segment in "${segments[@]}"; do
+    [[ -n "$segment" ]] || continue
+    current="$current/$segment"
+    if [[ -z "${seen_dirs[$current]:-}" ]]; then
+      dynamic_dirs+=(--dir "$current")
+      seen_dirs[$current]=1
+    fi
+  done
+}
+append_parent_dirs "$runtime_home"
+append_parent_dirs "$tenant_cwd"
+
+# Gateway starts adapters with its own environment merged into Service env.
+# Only names explicitly supplied by Backend publication may enter the Runtime.
+# Values remain in process memory and must never be printed in diagnostics.
+runtime_env_args=()
+read -ra runtime_env_names <<<"${EXPERT_ACP_RUNTIME_ENV_NAMES:-}"
+for env_name in "${runtime_env_names[@]}"; do
+  [[ "$env_name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] \
+    || fail "Runtime environment contains an invalid variable name"
+  [[ -v "$env_name" ]] || fail "published Runtime environment variable is missing"
+  runtime_env_args+=(--setenv "$env_name" "${!env_name}")
+done
+
+# Keep the outer Runtime boundary capability-free. The generated Codex
+# permission profile still starts its own Bubblewrap sandbox inside it.
+# Map host file ownership to a non-root namespace UID so nested user namespaces
+# can map that UID after capabilities are dropped (Linux restricts UID 0 maps).
+bwrap_args=(
+  --die-with-parent
+  --clearenv
+  --unshare-user
+  --uid 65534
+  --cap-drop ALL
+  --unshare-pid
+  --unshare-uts
+  --unshare-ipc
+  --unshare-cgroup-try
+  --proc /proc
+  --dev /dev
+  --dir /usr
+  --ro-bind /usr/bin /usr/bin
+  --ro-bind /usr/lib /usr/lib
+  --ro-bind /usr/lib64 /usr/lib64
+  --ro-bind /usr/sbin /usr/sbin
+  --ro-bind /usr/share /usr/share
+  --dir /usr/local
+  --ro-bind /usr/local/bin /usr/local/bin
+  --dir /usr/local/lib
+  --dir /usr/local/lib/nodejs
+  "${node_runtime_bind[@]}"
+  --symlink usr/bin /bin
+  --symlink usr/sbin /sbin
+  --symlink usr/lib /lib
+  --symlink usr/lib64 /lib64
+  --dir /etc
+  --ro-bind /etc/ssl /etc/ssl
+  --ro-bind /etc/ca-certificates /etc/ca-certificates
+  --ro-bind /etc/resolv.conf /etc/resolv.conf
+  --ro-bind /etc/hosts /etc/hosts
+  --ro-bind /etc/nsswitch.conf /etc/nsswitch.conf
+  --ro-bind /etc/passwd /etc/passwd
+  --ro-bind /etc/group /etc/group
+  --tmpfs /tmp
+  "${dynamic_dirs[@]}"
+  --bind "$runtime_home" "$runtime_home"
+  --bind "$tenant_cwd" "$tenant_cwd"
+)
+
+for readonly_path in \
+  "$runtime_home/AGENTS.md" \
+  "$runtime_home/config.toml" \
+  "$runtime_home/.agents/skills" \
+  "$runtime_home/knowledge"; do
+  if [[ -e "$readonly_path" ]]; then
+    bwrap_args+=(--ro-bind "$readonly_path" "$readonly_path")
+  fi
+done
+
+for optional_file in /etc/localtime /etc/machine-id /etc/os-release; do
+  if [[ -e "$optional_file" ]]; then
+    bwrap_args+=(--ro-bind "$optional_file" "$optional_file")
+  fi
+done
+
+exec setpriv --reuid "$runtime_uid" --regid "$runtime_gid" --clear-groups --no-new-privs \
+  bwrap "${bwrap_args[@]}" \
+  --chdir "$tenant_cwd" \
+  "${runtime_env_args[@]}" \
+  --setenv LANG C.UTF-8 \
+  --setenv HOME "$runtime_home" \
+  --setenv CODEX_HOME "$runtime_home" \
+  --setenv PATH "/usr/local/bin:$node_root/bin:/usr/bin:/bin" \
+  --setenv SHELL /bin/bash \
+  --setenv TMPDIR /tmp \
+  --setenv TEMP /tmp \
+  --setenv TMP /tmp \
+  -- "$real_adapter" "$@"

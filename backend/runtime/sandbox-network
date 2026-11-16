@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# Gateway adapter environments may omit the standard administrative binary path.
+export PATH="$PATH:/usr/sbin:/sbin"
+
+# This deployment boundary applies only to the dedicated Expert Runtime group.
+group_name=expert-runtime
+
+fail() {
+  printf 'Expert Runtime network boundary: %s\n' "$1" >&2
+  exit 70
+}
+
+resolve_group() {
+  runtime_gid="$(getent group "$group_name" | cut -d: -f3)" \
+    || fail "install the expert-runtime group before starting adapters"
+  [[ "$runtime_gid" =~ ^[1-9][0-9]*$ ]] || fail "invalid Runtime group"
+  rule=(
+    -p tcp -m owner --gid-owner "$runtime_gid"
+    -m multiport --dports 2019,8019
+    -m addrtype --dst-type LOCAL
+    -j REJECT --reject-with tcp-reset
+  )
+}
+
+check_rules() {
+  local firewall first_rule expected
+  for firewall in iptables ip6tables; do
+    "$firewall" -w 5 -C OUTPUT "${rule[@]}" >/dev/null 2>&1 \
+      || fail "$firewall management boundary is missing"
+    # An earlier ACCEPT could bypass an owner rule. Keep this narrow denial first.
+    first_rule="$("$firewall" -w 5 -S OUTPUT | sed -n '/^-A /{p;q;}')"
+    expected="-A OUTPUT -p tcp -m owner --gid-owner $runtime_gid -m multiport --dports 2019,8019 -m addrtype --dst-type LOCAL -j REJECT --reject-with tcp-reset"
+    [[ "$first_rule" = "$expected" ]] \
+      || fail "$firewall management boundary must be the first OUTPUT rule"
+  done
+}
+
+case "${1:-}" in
+  apply)
+    [[ "$(id -u)" = 0 ]] || fail "apply requires root"
+    getent group "$group_name" >/dev/null || groupadd --system "$group_name"
+    resolve_group
+    for firewall in iptables ip6tables; do
+      if "$firewall" -w 5 -C OUTPUT "${rule[@]}" >/dev/null 2>&1; then
+        "$firewall" -w 5 -D OUTPUT "${rule[@]}"
+      fi
+      "$firewall" -w 5 -I OUTPUT 1 "${rule[@]}"
+    done
+    check_rules
+    ;;
+  check)
+    resolve_group
+    check_rules
+    ;;
+  remove)
+    [[ "$(id -u)" = 0 ]] || fail "remove requires root"
+    resolve_group
+    for firewall in iptables ip6tables; do
+      if "$firewall" -w 5 -C OUTPUT "${rule[@]}" >/dev/null 2>&1; then
+        "$firewall" -w 5 -D OUTPUT "${rule[@]}"
+      fi
+    done
+    ;;
+  *)
+    fail "usage: sandbox-network {apply|check|remove}"
+    ;;
+esac
